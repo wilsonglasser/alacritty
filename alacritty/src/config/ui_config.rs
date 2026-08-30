@@ -124,6 +124,9 @@ impl UiConfig {
             default_cursor_style: self.cursor.style(),
             osc52: self.terminal.osc52.0,
             kitty_keyboard: true,
+            // Deliberately not a config option: embedders decide this per
+            // session, and alacritty itself keeps the widths it always had.
+            ambiguous_width_wide: false,
         }
     }
 

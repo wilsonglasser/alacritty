@@ -351,6 +351,15 @@ pub struct Config {
 
     /// OSC52 support mode.
     pub osc52: Osc52,
+
+    /// Whether characters in the Unicode East Asian Width class "Ambiguous"
+    /// occupy two cells instead of one.
+    ///
+    /// Box drawing, circled digits, arrows, Greek and Cyrillic letters are
+    /// one cell wide in Western contexts and two in legacy CJK ones. The
+    /// terminal and the programs running in it have to agree, so this
+    /// follows what the remote's `wcwidth` does rather than a global truth.
+    pub ambiguous_width_wide: bool,
 }
 
 impl Default for Config {
@@ -362,6 +371,7 @@ impl Default for Config {
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            ambiguous_width_wide: Default::default(),
         }
     }
 }
@@ -1037,6 +1047,16 @@ impl<T> Term<T> {
         trace!("Setting keyboard mode to {new_mode:?}");
         self.mode |= new_mode;
     }
+
+    /// Number of cells a character occupies.
+    ///
+    /// Everything outside the East Asian Width class "Ambiguous" answers the
+    /// same in both tables; `Config::ambiguous_width_wide` picks which answer
+    /// that class gets.
+    #[inline]
+    fn char_width(&self, c: char) -> Option<usize> {
+        if self.config.ambiguous_width_wide { c.width_cjk() } else { c.width() }
+    }
 }
 
 impl<T> Dimensions for Term<T> {
@@ -1061,7 +1081,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline(never)]
     fn input(&mut self, c: char) {
         // Number of cells the char will occupy.
-        let width = match c.width() {
+        let width = match self.char_width(c) {
             Some(width) => width,
             None => return,
         };
@@ -3298,5 +3318,102 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    /// A terminal of the given width, with the ambiguous width option set.
+    fn ambiguous_width_term(wide: bool, columns: usize) -> Term<VoidListener> {
+        let config = Config { ambiguous_width_wide: wide, ..Config::default() };
+        Term::new(config, &TermSize::new(columns, 3), VoidListener)
+    }
+
+    #[test]
+    fn ambiguous_width_defaults_to_narrow() {
+        let mut term = ambiguous_width_term(false, 10);
+
+        // Box drawing, a circled digit and a Greek letter: all "Ambiguous".
+        for c in ['│', '①', 'α'] {
+            term.input(c);
+        }
+
+        for column in 0..3 {
+            let cell = &term.grid()[Line(0)][Column(column)];
+            assert!(!cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER));
+        }
+        assert_eq!(term.grid().cursor.point.column, Column(3));
+    }
+
+    #[test]
+    fn ambiguous_width_wide_takes_two_cells() {
+        let mut term = ambiguous_width_term(true, 10);
+
+        term.input('│');
+
+        assert_eq!(term.grid()[Line(0)][Column(0)].c, '│');
+        assert!(term.grid()[Line(0)][Column(0)].flags.contains(Flags::WIDE_CHAR));
+        assert!(term.grid()[Line(0)][Column(1)].flags.contains(Flags::WIDE_CHAR_SPACER));
+        assert_eq!(term.grid().cursor.point.column, Column(2));
+    }
+
+    #[test]
+    fn unambiguously_sized_characters_ignore_the_option() {
+        for wide in [false, true] {
+            let mut term = ambiguous_width_term(wide, 10);
+
+            // Latin is narrow and Hiragana is wide in both tables.
+            term.input('a');
+            term.input('あ');
+
+            assert!(!term.grid()[Line(0)][Column(0)].flags.contains(Flags::WIDE_CHAR));
+            assert!(term.grid()[Line(0)][Column(1)].flags.contains(Flags::WIDE_CHAR));
+            assert!(term.grid()[Line(0)][Column(2)].flags.contains(Flags::WIDE_CHAR_SPACER));
+            assert_eq!(term.grid().cursor.point.column, Column(3));
+        }
+    }
+
+    #[test]
+    fn zero_width_characters_ignore_the_option() {
+        for wide in [false, true] {
+            let mut term = ambiguous_width_term(wide, 10);
+
+            term.input('e');
+            // COMBINING ACUTE ACCENT: zero width, rides the previous cell.
+            term.input('\u{0301}');
+
+            let cell = &term.grid()[Line(0)][Column(0)];
+            assert_eq!(cell.c, 'e');
+            assert_eq!(cell.zerowidth(), Some(&['\u{0301}'][..]));
+            assert_eq!(term.grid().cursor.point.column, Column(1));
+        }
+    }
+
+    #[test]
+    fn ambiguous_wide_character_wraps_at_the_last_column() {
+        let mut term = ambiguous_width_term(true, 3);
+
+        term.input('a');
+        term.input('b');
+        // Only one column left, and the glyph now needs two.
+        term.input('│');
+
+        assert!(term.grid()[Line(0)][Column(2)].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
+        assert!(term.grid()[Line(1)][Column(0)].flags.contains(Flags::WIDE_CHAR));
+        assert_eq!(term.grid()[Line(1)][Column(0)].c, '│');
+        assert!(term.grid()[Line(1)][Column(1)].flags.contains(Flags::WIDE_CHAR_SPACER));
+    }
+
+    #[test]
+    fn ambiguous_width_follows_a_config_change() {
+        let mut term = ambiguous_width_term(false, 10);
+
+        term.input('│');
+        assert!(!term.grid()[Line(0)][Column(0)].flags.contains(Flags::WIDE_CHAR));
+
+        term.set_options(Config { ambiguous_width_wide: true, ..Config::default() });
+        term.input('│');
+
+        // Cells already written keep the width they were written with.
+        assert!(!term.grid()[Line(0)][Column(0)].flags.contains(Flags::WIDE_CHAR));
+        assert!(term.grid()[Line(0)][Column(1)].flags.contains(Flags::WIDE_CHAR));
+        assert!(term.grid()[Line(0)][Column(2)].flags.contains(Flags::WIDE_CHAR_SPACER));
     }
 }
