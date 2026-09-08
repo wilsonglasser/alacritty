@@ -54,6 +54,21 @@ fn scroll_up() {
     assert_eq!(grid[Line(9)].occ, 0);
 }
 
+// The monotonic scroll counter keeps counting once the history is full.
+#[test]
+fn scrolled_lines_outlives_a_full_history() {
+    let mut grid = Grid::<usize>::new(3, 1, 5);
+
+    // Eight full-screen one-line scrolls: the first five fill the
+    // scrollback, the rest drop the oldest line to make room.
+    for _ in 0..8 {
+        grid.scroll_up::<usize>(&(Line(0)..Line(3)), 1);
+    }
+
+    assert_eq!(grid.history_size(), 5, "the scrollback is full");
+    assert_eq!(grid.scrolled_lines(), 8, "the counter never stopped");
+}
+
 // Scroll down moves lines downward.
 #[test]
 fn scroll_down() {

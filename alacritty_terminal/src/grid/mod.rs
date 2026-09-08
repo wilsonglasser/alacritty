@@ -135,6 +135,15 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// Total lines that have scrolled into the scrollback history.
+    ///
+    /// Unlike [`Self::history_size`] this keeps counting once the
+    /// history is full, where each line that scrolls in drops the
+    /// oldest one. It is the only monotonic measure of how far the
+    /// visible content has rotated, so the difference between two
+    /// reads is exactly how many rows the content moved in between.
+    scrolled_lines: usize,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -143,6 +152,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             raw: Storage::with_capacity(lines, columns),
             max_scroll_limit,
             display_offset: 0,
+            scrolled_lines: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
             lines,
@@ -272,6 +282,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         if region.start == 0 {
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
+
+            // Count the rotation whether or not the scrollback could
+            // still grow: once the ring is full the oldest line is
+            // dropped and `history_size` stops moving, while the
+            // content itself still rotated.
+            self.scrolled_lines += positions;
 
             // Swap the lines fixed at the top to their target positions after rotation.
             //
@@ -431,6 +447,18 @@ impl<T> Grid<T> {
     #[inline]
     pub fn display_offset(&self) -> usize {
         self.display_offset
+    }
+
+    /// Total lines that have scrolled into the scrollback history.
+    ///
+    /// Monotonic: it never resets (a history clear does not rewind
+    /// it), so the difference between two reads is always the number
+    /// of rows the content rotated in between. At the scrollback cap
+    /// the history size stops changing, and this is the only signal
+    /// left that rows are still moving.
+    #[inline]
+    pub fn scrolled_lines(&self) -> usize {
+        self.scrolled_lines
     }
 
     #[inline]
