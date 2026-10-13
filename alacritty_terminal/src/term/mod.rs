@@ -26,6 +26,7 @@ use crate::vte::ansi::{
     StandardCharset,
 };
 
+pub mod anchor;
 pub mod cell;
 pub mod color;
 pub mod search;
@@ -274,6 +275,9 @@ pub struct Term<T> {
 
     pub selection: Option<Selection>,
 
+    /// Rows held on the primary screen, moved with their content.
+    row_anchors: anchor::RowAnchors,
+
     /// Currently active grid.
     ///
     /// Tracks the screen buffer currently in use. While the alternate screen buffer is active,
@@ -449,6 +453,7 @@ impl<T> Term<T> {
             title_stack: Default::default(),
             is_focused: Default::default(),
             selection: Default::default(),
+            row_anchors: Default::default(),
             title: Default::default(),
             mode: Default::default(),
         }
@@ -661,6 +666,27 @@ impl<T> Term<T> {
         &mut self.grid
     }
 
+    /// Hold the primary screen's row `line` so it can be found again after
+    /// the content moves (see [`anchor`]). `None` while the alternate
+    /// screen is up: its rows are not the primary's and do not last.
+    pub fn hold_row(&mut self, line: Line) -> Option<anchor::RowAnchor> {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        Some(self.row_anchors.hold(line))
+    }
+
+    /// Where a held row is now, in primary screen coordinates, or `None`
+    /// once its content is gone.
+    pub fn held_row(&self, anchor: anchor::RowAnchor) -> Option<Line> {
+        self.row_anchors.line(anchor)
+    }
+
+    /// Stop holding a row.
+    pub fn release_row(&mut self, anchor: anchor::RowAnchor) {
+        self.row_anchors.release(anchor);
+    }
+
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
         let old_cols = self.columns();
@@ -686,6 +712,17 @@ impl<T> Term<T> {
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
+
+        // Held rows follow a height change like the selection does. A
+        // width change reflows rows into one another, and a resize under
+        // the alternate screen moves the primary by an amount not measured
+        // here, so both drop them.
+        if old_cols != num_cols || is_alt {
+            self.row_anchors.clear();
+        } else {
+            let (topmost, bottommost) = (self.grid.topmost_line(), self.grid.bottommost_line());
+            self.row_anchors.shift(delta, topmost, bottommost);
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -769,6 +806,9 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+        if !self.mode.contains(TermMode::ALT_SCREEN) {
+            self.row_anchors.scroll_down(&region, lines);
+        }
         self.mark_fully_damaged();
     }
 
@@ -788,6 +828,10 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        if !self.mode.contains(TermMode::ALT_SCREEN) {
+            let topmost = self.grid.topmost_line();
+            self.row_anchors.scroll_up(&region, lines, topmost);
+        }
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -1811,7 +1855,10 @@ impl<T: EventListener> Handler for Term<T> {
                 } else {
                     let old_offset = self.grid.display_offset();
 
-                    self.grid.clear_viewport();
+                    let pushed = self.grid.clear_viewport();
+                    let region = Line(0)..Line(self.screen_lines() as i32);
+                    let topmost = self.grid.topmost_line();
+                    self.row_anchors.scroll_up(&region, pushed, topmost);
 
                     // Compute number of lines scrolled by clearing the viewport.
                     let lines = self.grid.display_offset().saturating_sub(old_offset);
@@ -1824,6 +1871,8 @@ impl<T: EventListener> Handler for Term<T> {
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
                 self.grid.clear_history();
+                // Only the primary screen has a history, so this is its.
+                self.row_anchors.drop_history();
 
                 self.vi_mode_cursor.point.line =
                     self.vi_mode_cursor.point.line.grid_clamp(self, Boundary::Cursor);
@@ -1865,6 +1914,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.title_stack = Vec::new();
         self.title = None;
         self.selection = None;
+        self.row_anchors.clear();
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
@@ -3415,5 +3465,146 @@ mod tests {
         assert!(!term.grid()[Line(0)][Column(0)].flags.contains(Flags::WIDE_CHAR));
         assert!(term.grid()[Line(0)][Column(1)].flags.contains(Flags::WIDE_CHAR));
         assert!(term.grid()[Line(0)][Column(2)].flags.contains(Flags::WIDE_CHAR_SPACER));
+    }
+
+    fn held_char<T>(term: &Term<T>, held: anchor::RowAnchor) -> Option<char> {
+        let line = term.held_row(held)?;
+        Some(term.grid()[line][Column(0)].c)
+    }
+
+    #[test]
+    fn a_held_row_follows_its_content_through_a_full_history() {
+        let size = TermSize::new(5, 4);
+        let config = Config { scrolling_history: 3, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        term.input('x');
+        let held = term.hold_row(Line(0)).unwrap();
+        // Three linefeeds reach the bottom, three more fill the history.
+        for _ in 0..6 {
+            term.linefeed();
+        }
+        assert_eq!(term.held_row(held), Some(Line(-3)));
+        assert_eq!(held_char(&term, held), Some('x'));
+        // The history is full: the next row in pushes the oldest out.
+        term.linefeed();
+        assert_eq!(term.held_row(held), None);
+    }
+
+    #[test]
+    fn a_held_row_keeps_its_content_while_a_full_history_rotates() {
+        let size = TermSize::new(5, 4);
+        let config = Config { scrolling_history: 3, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        for _ in 0..10 {
+            term.linefeed();
+        }
+        assert_eq!(term.history_size(), 3);
+        term.input('y');
+        let held = term.hold_row(Line(3)).unwrap();
+        term.linefeed();
+        term.linefeed();
+        assert_eq!(term.history_size(), 3);
+        assert_eq!(term.held_row(held), Some(Line(1)));
+        assert_eq!(held_char(&term, held), Some('y'));
+    }
+
+    #[test]
+    fn a_region_at_the_top_moves_its_rows_and_not_the_fixed_bottom() {
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.goto(3, 0);
+        term.input('b');
+        term.goto(2, 0);
+        term.input('o');
+        let bar = term.hold_row(Line(3)).unwrap();
+        let output = term.hold_row(Line(2)).unwrap();
+        // Rows 1..=3 (1-based) scroll; row 4 stays, the way `apt` keeps
+        // its progress bar.
+        term.set_scrolling_region(1, Some(3));
+        term.goto(2, 0);
+        term.linefeed();
+        assert_eq!(term.held_row(output), Some(Line(1)));
+        assert_eq!(held_char(&term, output), Some('o'));
+        assert_eq!(term.held_row(bar), Some(Line(3)));
+        assert_eq!(held_char(&term, bar), Some('b'));
+    }
+
+    #[test]
+    fn a_reverse_index_at_the_top_moves_rows_down() {
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.goto(1, 0);
+        term.input('r');
+        let held = term.hold_row(Line(1)).unwrap();
+        term.goto(0, 0);
+        term.reverse_index();
+        assert_eq!(term.held_row(held), Some(Line(2)));
+        assert_eq!(held_char(&term, held), Some('r'));
+    }
+
+    #[test]
+    fn clearing_the_screen_carries_rows_into_the_history() {
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.goto(1, 0);
+        term.input('c');
+        let held = term.hold_row(Line(1)).unwrap();
+        term.clear_screen(ansi::ClearMode::All);
+        let line = term.held_row(held).expect("still in the history");
+        assert!(line < 0);
+        assert_eq!(held_char(&term, held), Some('c'));
+        // And clearing the history takes it.
+        term.clear_screen(ansi::ClearMode::Saved);
+        assert_eq!(term.held_row(held), None);
+    }
+
+    #[test]
+    fn a_height_change_keeps_held_rows_on_their_content() {
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.input('h');
+        let held = term.hold_row(Line(0)).unwrap();
+        for _ in 0..6 {
+            term.linefeed();
+        }
+        term.resize(TermSize::new(5, 7));
+        assert_eq!(held_char(&term, held), Some('h'));
+        term.resize(TermSize::new(5, 3));
+        assert_eq!(held_char(&term, held), Some('h'));
+    }
+
+    #[test]
+    fn a_width_change_drops_held_rows() {
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let held = term.hold_row(Line(0)).unwrap();
+        term.resize(TermSize::new(8, 4));
+        assert_eq!(term.held_row(held), None);
+    }
+
+    #[test]
+    fn the_alternate_screen_neither_holds_nor_moves_primary_rows() {
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.goto(2, 0);
+        term.input('p');
+        let held = term.hold_row(Line(2)).unwrap();
+        term.swap_alt();
+        assert!(term.hold_row(Line(0)).is_none());
+        for _ in 0..10 {
+            term.linefeed();
+        }
+        term.swap_alt();
+        assert_eq!(term.held_row(held), Some(Line(2)));
+        assert_eq!(held_char(&term, held), Some('p'));
+    }
+
+    #[test]
+    fn a_reset_drops_held_rows() {
+        let size = TermSize::new(5, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let held = term.hold_row(Line(0)).unwrap();
+        term.reset_state();
+        assert_eq!(term.held_row(held), None);
     }
 }
